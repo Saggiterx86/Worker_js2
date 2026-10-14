@@ -1,0 +1,689 @@
+// ============================================================
+// PART 4A-1 — Menu + Helpers
+// ============================================================
+
+async function sendMainMenu(chatId, env) {
+  try {
+    await fetch(
+      "https://api.telegram.org/bot" + env.BOT_TOKEN + "/sendMessage",
+      { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, text: "⌨️", reply_markup: { remove_keyboard: true } }) }
+    );
+  } catch (e) {}
+  const kb = {
+    inline_keyboard: [
+      [{ text: "⚽ Football Analysis", callback_data: "football_analysis" }],
+      [{ text: "📊 Streaks", callback_data: "streaks" }],
+      [{ text: "📋 Audit", callback_data: "audit" }],
+      [{ text: "📊 API Usage", callback_data: "apiusage" }],
+      [{ text: "📊 Round Stats", callback_data: "roundstats" }]
+    ]
+  };
+  await sendMessage(chatId, "⚽ SaggiterX Football Bot\n\n/team [name] — Team stats\n/streaks — Streaks\n/inferlist — Infer events\n/infercheck — Formula check\n/inferfetch — Infer fetch now", env, kb);
+}
+
+async function sendFootballMenu(chatId, env) {
+  const kb = {
+    inline_keyboard: [
+      [{ text: "📅 Current Round", callback_data: "current_round" }],
+      [{ text: "📅 Next Round", callback_data: "next_round" }],
+      [{ text: "⭐ Other League (O2.5)", callback_data: "other_league" }]
+    ]
+  };
+  await sendMessage(chatId, "⚽ Football Analysis", env, kb);
+}
+
+async function sendMessage(chatId, text, env, kb, replyTo) {
+  const body = { chat_id: chatId, text: text };
+  if (kb) body.reply_markup = kb;
+  if (replyTo) body.reply_parameters = { message_id: replyTo };
+  return await fetch(
+    "https://api.telegram.org/bot" + env.BOT_TOKEN + "/sendMessage",
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+  );
+}
+
+async function answerCallback(id, env) {
+  await fetch(
+    "https://api.telegram.org/bot" + env.BOT_TOKEN + "/answerCallbackQuery",
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ callback_query_id: id }) }
+  );
+}
+
+async function footballDataRequest(url, env) {
+  const res = await fetch(url, {
+    method: "GET",
+    headers: { "X-Auth-Token": env.FOOTBALL_DATA_API_KEY, "Accept": "application/json" }
+  });
+  const txt = await res.text();
+  let data;
+  try { data = JSON.parse(txt); }
+  catch (e) { throw new Error("JSON err HTTP " + res.status); }
+  if (!res.ok) throw new Error("HTTP " + res.status + ": " + (data.message || "?"));
+  return data;
+}
+
+async function getCompetitionMatches(code, env) {
+  return await footballDataRequest("https://api.football-data.org/v4/competitions/" + code + "/matches", env);
+}
+
+function formatMM(utcDate) {
+  const ts = Date.parse(utcDate);
+  if (isNaN(ts)) return "?";
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Yangon",
+    day: "2-digit", month: "2-digit",
+    hour: "2-digit", minute: "2-digit", hour12: false
+  }).format(ts);
+}
+
+async function getRoundMatches(code, mode, env) {
+  const data = await getCompetitionMatches(code, env);
+  const matches = Array.isArray(data.matches) ? data.matches : [];
+  if (!matches.length) return { matchday: null, matches: [] };
+  const now = Date.now();
+  const DAY = 24 * 60 * 60 * 1000;
+  const withTs = matches.filter(function(m) {
+    if (!m.utcDate) return false;
+    const k = Date.parse(m.utcDate);
+    return !isNaN(k);
+  }).map(function(m) {
+    return { m: m, ts: Date.parse(m.utcDate) };
+  }).sort(function(a, b) { return a.ts - b.ts; });
+  const future = withTs.filter(function(x) { return x.ts >= now; });
+  if (!future.length) return { matchday: null, matches: [] };
+  const in7 = future.filter(function(x) { return x.ts <= now + 7 * DAY; });
+  const in14 = future.filter(function(x) { return x.ts > now + 7 * DAY && x.ts <= now + 14 * DAY; });
+  let pick;
+  if (mode === "current") {
+    pick = in7.length ? in7 : future.slice(0, 20);
+  } else {
+    pick = in14.length ? in14 : (in7.length ? future.slice(in7.length, in7.length + 20) : future.slice(20, 40));
+  }
+  if (!pick.length) return { matchday: null, matches: [] };
+  const md = pick[0].m.matchday;
+  const target = (md !== null && md !== undefined) ? md : pick[0].m.id;
+  const rm = withTs.filter(function(x) {
+    const xmd = x.m.matchday;
+    if (target !== null && xmd !== null && xmd !== undefined) return xmd === target;
+    return false;
+  }).sort(function(a, b) { return a.ts - b.ts; }).map(function(x) { return x.m; });
+  const finalList = rm.length ? rm : pick.map(function(x) { return x.m; });
+  return { matchday: target, matches: finalList };
+}
+
+function getNightDay(utcDate) {
+  const ts = Date.parse(utcDate);
+  if (isNaN(ts)) return null;
+  const mm = ts + (6 * 60 + 30) * 60 * 1000;
+  const d = new Date(mm);
+  const day = d.getUTCDay();
+  const hour = d.getUTCHours();
+  if (hour >= 16) return day;
+  if (hour < 6) return (day + 6) % 7;
+  return null;
+}
+
+const HINT_RULES = [];
+function registerHint(fn) { HINT_RULES.push(fn); }
+
+function buildHints(lgCode, matches) {
+  const hints = {};
+  const byN = {};
+  for (const m of matches) {
+    const nd = getNightDay(m.utcDate);
+    if (nd === null) continue;
+    if (!byN[nd]) byN[nd] = [];
+    byN[nd].push(m);
+  }
+  for (const ndStr of Object.keys(byN)) {
+    const nd = parseInt(ndStr);
+    const ms = byN[ndStr].slice().sort(function(a, b) { return Date.parse(a.utcDate) - Date.parse(b.utcDate); });
+    const firstId = ms[0].id;
+    const lastId = ms[ms.length - 1].id;
+    if (nd === 5) {
+      if (lgCode === "BL1" || lgCode === "FL1") for (const m of ms) hints[m.id] = "ဂိုးပေါ်";
+    } else if (nd === 6) {
+      if (lgCode === "PL") hints[firstId] = "ဂိုးအောက်";
+      if (lgCode === "PD") hints[firstId] = "ဂိုးပေါ်";
+      if (lgCode === "FL1") hints[lastId] = "ဂိုးအောက်";
+    } else if (nd === 0) {
+      if (lgCode === "BL1") for (const m of ms) hints[m.id] = "ဂိုးပေါ်";
+      if (lgCode === "FL1") hints[firstId] = "ဂိုးပေါ်";
+      if (lgCode === "SA") hints[firstId] = "ဂိုးပေါ်";
+    }
+  }
+  for (const rule of HINT_RULES) {
+    try { rule(hints, lgCode, matches, byN); } catch (e) { console.log("hint err: " + e.message); }
+  }
+  return hints;
+}
+
+function normName(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function nameMatch(a, b) {
+  const na = normName(a);
+  const nb = normName(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  if (na.indexOf(nb) >= 0 || nb.indexOf(na) >= 0) return true;
+  const ta = na.split(" ").filter(function(x) { return x.length >= 3; });
+  const tb = nb.split(" ").filter(function(x) { return x.length >= 3; });
+  if (!ta.length || !tb.length) return false;
+  let hit = 0;
+  ta.forEach(function(x) {
+    if (tb.some(function(y) { return y === x || y.indexOf(x) === 0 || x.indexOf(y) === 0; })) hit++;
+  });
+  return hit / Math.max(ta.length, tb.length) >= 0.5;
+}
+
+async function findSheetO25(sheetData, home, away) {
+  if (!sheetData || !sheetData.matches) return null;
+  for (const m of sheetData.matches) {
+    if (m.o25 !== "Y") continue;
+    if (nameMatch(m.home, home) && nameMatch(m.away, away)) return m;
+    if (nameMatch(m.home, away) && nameMatch(m.away, home)) return m;
+  }
+  return null;
+}
+
+async function findSheetAny(sheetData, home, away) {
+  if (!sheetData || !sheetData.matches) return null;
+  for (const m of sheetData.matches) {
+    if (nameMatch(m.home, home) && nameMatch(m.away, away)) return m;
+    if (nameMatch(m.home, away) && nameMatch(m.away, home)) return m;
+  }
+  return null;
+}
+
+async function getStreaksCache(env) {
+  try {
+    const raw = await env.BOT_KV.get("streaks:cache");
+    if (raw) {
+      const d = JSON.parse(raw);
+      if (d && d.ts && (Date.now() - d.ts) < 30 * 60 * 1000) return d.data;
+    }
+  } catch (e) {}
+  try {
+    const res = await fetch(SHEET_URL + "?action=streaks", { redirect: "follow" });
+    const data = JSON.parse(await res.text());
+    if (data && data.ok) {
+      try { await env.BOT_KV.put("streaks:cache", JSON.stringify({ ts: Date.now(), data: data }), { expirationTtl: 1800 }); } catch (e) {}
+      return data;
+    }
+  } catch (e) {}
+  return null;
+}
+
+function streakBadgeByName(teamName, streaks) {
+  if (!streaks || !streaks.teamStreaks || !teamName) return "";
+  const norm = function(s) { return String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim(); };
+  const q = norm(teamName);
+  if (!q) return "";
+  const keys = Object.keys(streaks.teamStreaks);
+  let best = null;
+  for (let i = 0; i < keys.length; i++) {
+    const t = streaks.teamStreaks[keys[i]];
+    const n = norm(t.name);
+    if (!n) continue;
+    if (n === q) { best = t; break; }
+    if (!best && (n.indexOf(q) >= 0 || q.indexOf(n) >= 0)) best = t;
+  }
+  if (!best) return "";
+  const parts = [];
+  if (best.ha) parts.push("HA:" + best.ha.type + best.ha.count);
+  if (best.ah) parts.push("AH:" + best.ah.type + best.ah.count);
+  if (best.ou) parts.push("O/U:" + best.ou.type + best.ou.count);
+  return parts.join(",");
+}
+
+function formatButtonDateTime(m) {
+  const dateStr = String(m.date || "").trim();
+  const match = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):?(\d{2}))?/);
+  if (match) {
+    const mm = match[2];
+    const dd = match[3];
+    const hh = match[4] || "";
+    const mi = match[5] || "";
+    if (hh && mi) return mm + "/" + dd + " " + hh + ":" + mi;
+    return mm + "/" + dd;
+  }
+  const ts = Number(m.timestamp || 0);
+  if (ts > 0) {
+    const mmTime = new Date(ts + 6.5 * 3600 * 1000);
+    const mm = String(mmTime.getUTCMonth() + 1).padStart(2, "0");
+    const dd = String(mmTime.getUTCDate()).padStart(2, "0");
+    const hh = String(mmTime.getUTCHours()).padStart(2, "0");
+    const mi = String(mmTime.getUTCMinutes()).padStart(2, "0");
+    return mm + "/" + dd + " " + hh + ":" + mi;
+  }
+  return dateStr;
+}
+
+async function saveMatchState(env, chatId, s) {
+  await env.BOT_KV.put("match:" + chatId, JSON.stringify(s), { expirationTtl: 3600 });
+}
+async function getSavedMatch(env, chatId) {
+  const r = await env.BOT_KV.get("match:" + chatId);
+  return r ? JSON.parse(r) : null;
+}
+async function clearMatchState(env, chatId) {
+  await env.BOT_KV.delete("match:" + chatId);
+}
+// ============================================================
+// PART 4A-2 — Round Scan + Match Detail
+// ============================================================
+
+async function runRoundScan(chatId, mode, env) {
+  await sendMessage(chatId, mode === "current" ? "📅 CURRENT ROUND" : "📅 NEXT ROUND", env);
+  const sheetCacheRaw = await env.BOT_KV.get("sheet:cache");
+  let sheetData = null;
+  if (sheetCacheRaw) { try { sheetData = JSON.parse(sheetCacheRaw); } catch (e) {} }
+  let streaks = null;
+  try { streaks = await getStreaksCache(env); } catch (e) {}
+  let found = false;
+  let first = true;
+  for (const lg of LEAGUES) {
+    if (!first) await new Promise(function(r) { setTimeout(r, 3000); });
+    first = false;
+    try {
+      const result = await getRoundMatches(lg.code, mode, env);
+      if (!result.matches || !result.matches.length) continue;
+      found = true;
+      const hints = buildHints(lg.code, result.matches);
+      let text = lg.flag + " " + lg.name + "\nRound " + result.matchday + " — " + result.matches.length + " ပွဲ";
+      const btns = [];
+      for (const m of result.matches) {
+        const h = (m.homeTeam && (m.homeTeam.shortName || m.homeTeam.name)) || "?";
+        const a = (m.awayTeam && (m.awayTeam.shortName || m.awayTeam.name)) || "?";
+        const k = formatMM(m.utcDate);
+        const status = String(m.status || "").toUpperCase();
+        let scoreStr = "";
+        if (status === "FINISHED" && m.score && m.score.fullTime) {
+          const ftH = m.score.fullTime.home, ftA = m.score.fullTime.away;
+          if (ftH !== null && ftA !== null) scoreStr = " " + ftH + "-" + ftA;
+        } else if ((status === "IN_PLAY" || status === "PAUSED") && m.score && m.score.fullTime) {
+          const ftH = m.score.fullTime.home, ftA = m.score.fullTime.away;
+          if (ftH !== null && ftA !== null) scoreStr = " " + ftH + "-" + ftA;
+        }
+        let prefix = "·";
+        if (status === "FINISHED") prefix = "✅";
+        else if (status === "IN_PLAY" || status === "PAUSED") prefix = "🔴";
+        let sheetHit = null;
+        if (sheetData) sheetHit = await findSheetO25(sheetData, m.homeTeam && m.homeTeam.name, m.awayTeam && m.awayTeam.name);
+        if (sheetHit && status !== "FINISHED") {
+          const stars = sheetHit.htStars || 0;
+          if (stars >= 2) prefix = "⭐⭐";
+          else if (stars === 1) prefix = "⭐";
+        } else if (hints[m.id] && status !== "FINISHED") {
+          prefix = "💡";
+        }
+        if (streaks && streaks.teams && status !== "FINISHED") {
+          const hn = (m.homeTeam && (m.homeTeam.shortName || m.homeTeam.name)) || "";
+          const an = (m.awayTeam && (m.awayTeam.shortName || m.awayTeam.name)) || "";
+          const hb = streakBadgeByName(hn, streaks);
+          const ab = streakBadgeByName(an, streaks);
+          if (hb || ab) prefix = "💥";
+        }
+        const hShort = String(h).slice(0, 8);
+        const aShort = String(a).slice(0, 8);
+        const kShort = String(k).replace(",", "");
+        const btnText = prefix + hShort + " vs " + aShort + scoreStr + " | " + kShort;
+        btns.push([{ text: btnText, callback_data: "m:" + lg.code + ":" + m.id }]);
+      }
+      await sendMessage(chatId, text, env, { inline_keyboard: btns });
+    } catch (e) {
+      await sendMessage(chatId, lg.flag + " " + lg.name + "\n❌ " + e.message, env);
+    }
+  }
+  if (!found) await sendMessage(chatId, "❌ ပွဲစဉ်မတွေ့ပါ", env);
+}
+
+async function sendOtherLeague(chatId, env) {
+  const c = await env.BOT_KV.get("sheet:cache");
+  if (!c) { await sendMessage(chatId, "❌ Cache မရပါ။ /refresh ရိုက်ပါ။", env); return; }
+  const data = JSON.parse(c);
+  if (!data.matches || !data.matches.length) { await sendMessage(chatId, "❌ Sheet data ဗလာ", env); return; }
+  const others = data.matches.filter(function(m) {
+    if (m.o25 !== "Y") return false;
+    const n = String(m.league || "").toLowerCase().trim();
+    return !SIX_LEAGUE_NAMES.some(function(x) { return n === x; });
+  });
+  if (!others.length) { await sendMessage(chatId, "⭐ Other League: O2.5=Y မရှိပါ", env); return; }
+  const btns = [];
+  const seen = {};
+  others.forEach(function(m) {
+    const key = String(m.id);
+    if (seen[key]) return;
+    seen[key] = true;
+    const h = String(m.home || "?").slice(0, 5);
+    const a = String(m.away || "?").slice(0, 5);
+    const dt = formatButtonDateTime(m);
+    btns.push([{ text: h + " vs " + a + " " + dt, callback_data: "sm:" + m.id }]);
+  });
+  await sendMessage(chatId, "OTHER LEAGUE (O2.5=Y)\n" + btns.length + " ပွဲ\n\n👇 ပွဲတစ်ပွဲ နှိပ်ပါ။", env, { inline_keyboard: btns });
+}
+
+async function showSheetMatchDetail(chatId, sheetId, env, replyTo) {
+  const c = await env.BOT_KV.get("sheet:cache");
+  if (!c) { await sendMessage(chatId, "❌ Cache မရပါ။ /refresh ရိုက်ပါ။", env); return; }
+  const data = JSON.parse(c);
+  const m = (data.matches || []).find(function(x) { return String(x.id) === String(sheetId); });
+  if (!m) { await sendMessage(chatId, "❌ ပွဲရှာမတွေ့ပါ", env); return; }
+  await saveMatchState(env, chatId, { leagueCode: null, matchId: String(m.id), home: m.home, away: m.away, upperTeam: null, detailMsgId: null });
+  let text = "🏆 " + (m.league || "?") + "\n";
+  text += "🏟️ " + m.home + " vs " + m.away + "\n";
+  text += "🕒 " + (m.date || "?") + "\n";
+  text += formatSheetDetail(m);
+
+  const infer = await findInferForTeam(m.home, env) || await findInferForTeam(m.away, env);
+  if (infer) {
+    text += "\n📊 Infer (next match)\n";
+    text += "🏆 " + infer.league + "\n";
+    text += "🏟️ " + infer.home + " vs " + infer.away + "\n";
+    text += "🕒 " + infer.scheduled_at + "\n";
+    text += "Open AH: " + (infer.open.ah ? infer.open.ah.line : '-') + " | Cur AH: " + (infer.cur.ah ? infer.cur.ah.line : '-') + "\n";
+    text += "Open Tot: " + (infer.open.total ? infer.open.total.line : '-') + " | Cur Tot: " + (infer.cur.total ? infer.cur.total.line : '-') + "\n";
+    text += "Flip: " + (infer.bodyFlip ? 'YES' : 'no') + " | Move: " + (infer.move || '-') + "\n";
+    if (infer.formula2.pass) text += "🎯 F2: OVER " + infer.formula2.line + "\n";
+    if (infer.formula3.pass) text += "🎯 F3: UNDER (" + infer.formula3.openLine + "→" + infer.formula3.curLine + ")\n";
+  } else {
+    text += "\n📊 Infer: No data\n";
+  }
+
+  const fresh = await getFreshness(env);
+  if (fresh) text += "\n📊 Data: CSV " + fresh.csvDate + " | API " + fresh.apiDate;
+  text += "\n\n❓ ဘယ်အသင်းက အထက်ကြေးလဲ?";
+  const kb = { inline_keyboard: [[{ text: "⬆️ " + m.home, callback_data: "up:A" }], [{ text: "⬆️ " + m.away, callback_data: "up:B" }]] };
+  await sendMessage(chatId, text, env, kb, replyTo);
+}
+
+async function showMatchDetail(chatId, lgCode, matchId, env, replyTo) {
+  try {
+    const data = await getCompetitionMatches(lgCode, env);
+    const m = (data.matches || []).find(function(x) { return String(x.id) === String(matchId); });
+    if (!m) { await sendMessage(chatId, "❌ Data မရှိတော့ပါ", env); return; }
+    const h = (m.homeTeam && m.homeTeam.name) || "?";
+    const a = (m.awayTeam && m.awayTeam.name) || "?";
+    const k = formatMM(m.utcDate);
+    const lg = LEAGUES.find(function(x) { return x.code === lgCode; });
+    await saveMatchState(env, chatId, { leagueCode: lgCode, matchId: matchId, home: h, away: a, upperTeam: null, detailMsgId: null });
+    let text = "";
+    if (lg) text += lg.flag + " " + lg.name + "\n";
+    text += "🏟️ " + h + " vs " + a + "\n🕒 " + k + "\n📅 MD " + (m.matchday || "?");
+
+    const status = String(m.status || "").toUpperCase();
+    const ft = (m.score && m.score.fullTime) ? m.score.fullTime : null;
+    const ht = (m.score && m.score.halfTime) ? m.score.halfTime : null;
+    const ftH = ft && (ft.home !== null && ft.home !== undefined) ? ft.home : null;
+    const ftA = ft && (ft.away !== null && ft.away !== undefined) ? ft.away : null;
+    const htH = ht && (ht.home !== null && ht.home !== undefined) ? ht.home : null;
+    const htA = ht && (ht.away !== null && ht.away !== undefined) ? ht.away : null;
+
+    if (status === "FINISHED" && ftH !== null && ftA !== null) {
+      text += "\n\n✅ ပြီးဆုံး — FT " + ftH + " - " + ftA;
+      if (htH !== null && htA !== null) text += " (HT " + htH + " - " + htA + ")";
+      const tot = ftH + ftA;
+      const ouRes = tot > 2.5 ? "O" : (tot < 2.5 ? "U" : "P");
+      const haRes = ftH > ftA ? "W" : (ftH < ftA ? "L" : "D");
+      text += "\n📊 O/U: " + ouRes + " | HA: " + haRes;
+    } else if (status === "IN_PLAY" || status === "PAUSED") {
+      text += "\n\n⏳ ကစားနေဆဲ";
+      if (ftH !== null && ftA !== null) text += " — " + ftH + " - " + ftA;
+      if (htH !== null && htA !== null) text += " (HT " + htH + " - " + htA + ")";
+    } else if (status === "SCHEDULED" || status === "TIMED") {
+      text += "\n\n⏰ မ စရသေး";
+    } else if (ftH !== null && ftA !== null) {
+      text += "\n\n📊 " + status + " — " + ftH + " - " + ftA;
+    }
+
+    const streaks = await getStreaksCache(env);
+    if (streaks && streaks.teams) {
+      const hb = streakBadgeByName(h, streaks);
+      const ab = streakBadgeByName(a, streaks);
+      if (hb || ab) {
+        text += "\n\n📊 Streak Hints";
+        if (hb) text += "\n💥 " + h + "\n   " + hb;
+        if (ab) text += "\n💥 " + a + "\n   " + ab;
+      }
+    }
+    const sheetRaw = await env.BOT_KV.get("sheet:cache");
+    if (sheetRaw) {
+      try {
+        const sd = JSON.parse(sheetRaw);
+        const sm = await findSheetAny(sd, h, a);
+        if (sm) text += formatSheetDetail(sm);
+      } catch (e) {}
+    }
+
+    const infer = await findInferForTeam(h, env) || await findInferForTeam(a, env);
+    if (infer) {
+      text += "\n📊 Infer (next match)\n";
+      text += "🏆 " + infer.league + "\n";
+      text += "🏟️ " + infer.home + " vs " + infer.away + "\n";
+      text += "🕒 " + infer.scheduled_at + "\n";
+      text += "Open AH: " + (infer.open.ah ? infer.open.ah.line : '-') + " | Cur AH: " + (infer.cur.ah ? infer.cur.ah.line : '-') + "\n";
+      text += "Open Tot: " + (infer.open.total ? infer.open.total.line : '-') + " | Cur Tot: " + (infer.cur.total ? infer.cur.total.line : '-') + "\n";
+      text += "Flip: " + (infer.bodyFlip ? 'YES' : 'no') + " | Move: " + (infer.move || '-') + "\n";
+      if (infer.formula2.pass) text += "🎯 F2: OVER " + infer.formula2.line + "\n";
+      if (infer.formula3.pass) text += "🎯 F3: UNDER (" + infer.formula3.openLine + "→" + infer.formula3.curLine + ")\n";
+    } else {
+      text += "\n📊 Infer: No data\n";
+    }
+
+    const fresh = await getFreshness(env);
+    if (fresh) text += "\n📊 Data: CSV " + fresh.csvDate + " | API " + fresh.apiDate;
+    text += "\n\n❓ ဘယ်အသင်းက အထက်ကြေးလဲ?";
+    const kb = { inline_keyboard: [[{ text: "⬆️ " + h, callback_data: "up:A" }], [{ text: "⬆️ " + a, callback_data: "up:B" }]] };
+    await sendMessage(chatId, text, env, kb, replyTo);
+  } catch (e) {
+    await sendMessage(chatId, "⚠️ Match detail error: " + e.message, env);
+  }
+}
+// ============================================================
+// PART 4B — refreshSheetCache + Tricks + Round Stats
+// ============================================================
+
+async function refreshSheetCache(env) {
+  try {
+    const res = await fetch(SHEET_URL, { redirect: "follow" });
+    const data = JSON.parse(await res.text());
+    let count = 0;
+    if (data && data.ok) {
+      await env.BOT_KV.put("sheet:cache", JSON.stringify(data), { expirationTtl: 7200 });
+      count = data.count || 0;
+    }
+
+    const auditData = JSON.parse(await (await fetch(SHEET_URL + "?action=audit", { redirect: "follow" })).text());
+    if (auditData && auditData.ok) await env.BOT_KV.put("audit:cache", JSON.stringify(auditData), { expirationTtl: 7200 });
+
+    const apiData = JSON.parse(await (await fetch(SHEET_URL + "?action=apiusage", { redirect: "follow" })).text());
+    if (apiData && apiData.ok) await env.BOT_KV.put("api:cache", JSON.stringify(apiData), { expirationTtl: 7200 });
+
+    try {
+      const streaksData = JSON.parse(await (await fetch(SHEET_URL + "?action=streaks", { redirect: "follow" })).text());
+      if (streaksData && streaksData.ok) {
+        await env.BOT_KV.put("streaks:cache", JSON.stringify({ ts: Date.now(), data: streaksData }), { expirationTtl: 1800 });
+      }
+    } catch (e) {}
+
+    try {
+      const aliasesData = JSON.parse(await (await fetch(SHEET_URL + "?action=inferalias", { redirect: "follow" })).text());
+      if (aliasesData && aliasesData.ok && aliasesData.aliases) {
+        await env.BOT_KV.put("infer:aliases", JSON.stringify({ ts: Date.now(), data: aliasesData.aliases }), { expirationTtl: 21600 });
+      }
+    } catch (e) {}
+
+    return "OK:" + count;
+  } catch (e) {
+    return "ERR:" + e.message;
+  }
+}
+
+const TRICKS = [];
+function registerTrick(fn) { TRICKS.push(fn); }
+function runTricks(p) {
+  return TRICKS.map(function(fn) {
+    try { return fn(p); } catch (e) { return { name: fn.name, pass: false, note: "err" }; }
+  });
+}
+
+async function runTrickCheck(chatId, p, env, replyTo) {
+  const results = runTricks(p);
+  let out = "🧪 Odds Test\n\n";
+  out += "⬆️ " + p.upperTeam + "\n";
+  out += "⬇️ " + p.lowerTeam + "\n\n";
+  out += "Body : " + p.body + "\n";
+  out += "Total : " + p.total + "\n\n";
+  out += "📌 Theories\n\n";
+  let any = false, tip = "";
+  for (const r of results) {
+    if (r.pass) { any = true; out += "✅ " + r.name + "\n" + r.note + "\n\n"; tip = r.note; }
+  }
+  if (!any) out += "❌ မကိုက်ပါ\n";
+  if (tip) out += "🎯 " + tip + " ⭐";
+  await sendMessage(chatId, out, env, undefined, replyTo);
+  await clearMatchState(env, chatId);
+}
+
+registerTrick(function theory1zone3zone(p) {
+  const bOk = /^1(=|\+10|\+20|-10|-20)?$/.test(p.body);
+  const tOk = /^3(=|-\d+)?$/.test(p.total);
+  const pass = bOk && tOk;
+  let note = "";
+  if (pass) note = "အောက်အသင်း ဂိုးသွင်းနိုင်";
+  else if (!bOk) note = "Body မကိုက် (" + p.body + ")";
+  else note = "Total မကိုက် (" + p.total + ")";
+  return { name: "Theory 2 — 1= / 3-", pass: pass, note: note };
+});
+
+registerTrick(function theoryLaLigaOver(p) {
+  const isPD = p.leagueCode === "PD";
+  const tm = p.total.match(/^3\+(\d+)$/);
+  const tn = tm ? parseInt(tm[1]) : null;
+  const tOk = tn !== null && tn >= 30 && tn <= 70;
+  const bm = p.body.match(/^-(\d+)$/);
+  const bn = bm ? parseInt(bm[1]) : null;
+  const bOk = bn !== null && bn >= 50 && bn <= 100;
+  const pass = isPD && tOk && bOk;
+  let note = "";
+  if (pass) note = "ဂိုးပေါ်";
+  else if (!isPD) note = "La Liga မဟုတ် (" + (p.leagueCode || "?") + ")";
+  else if (!tOk) note = "Total မကိုက်";
+  else note = "Body မကိုက်";
+  return { name: "Theory 3 — La Liga Over", pass: pass, note: note };
+});
+
+registerTrick(function theoryChampionshipOver(p) {
+  const isELC = p.leagueCode === "ELC";
+  const b = p.body;
+  let bOk = false;
+  if (b === "0") bOk = true;
+  else if (/^-\d+$/.test(b)) { const n = parseInt(b.slice(1)); if (n >= 10 && n <= 100) bOk = true; }
+  else if (/^1-(\d+)$/.test(b)) { const n = parseInt(b.match(/^1-(\d+)$/)[1]); if (n >= 10 && n <= 50) bOk = true; }
+  const tm = p.total.match(/^3\+(\d+)$/);
+  const tn = tm ? parseInt(tm[1]) : null;
+  const tOk = tn !== null && tn >= 30 && tn <= 70;
+  const pass = isELC && bOk && tOk;
+  let note = "";
+  if (pass) note = "ဂိုးပေါင်းအပေါ်";
+  else if (!isELC) note = "Championship မဟုတ် (" + (p.leagueCode || "?") + ")";
+  else if (!bOk) note = "Body မကိုက် (" + b + ")";
+  else note = "Total မကိုက် (" + p.total + ")";
+  return { name: "Theory 4 — Championship Over", pass: pass, note: note };
+});
+
+registerHint(function satChampionshipHint(hints, lgCode, matches, byN) {
+  if (lgCode !== "ELC") return;
+  if (!byN[6] || !byN[6].length) return;
+  const ms = byN[6].slice().sort(function(a, b) { return Date.parse(a.utcDate) - Date.parse(b.utcDate); });
+  hints[ms[0].id] = "O2.5";
+});
+
+async function sendRoundStats(chatId, env) {
+  try {
+    const res = await fetch(SHEET_URL + "?action=roundstats", { redirect: "follow" });
+    const data = JSON.parse(await res.text());
+    if (!data || !data.ok) { await sendMessage(chatId, "⚠️ Round Stats မရပါ", env); return; }
+
+    let text = "📊 ROUND STATS\n";
+    if (data.updated) text += "📅 " + data.updated + "\n";
+    text += "\n";
+
+    const leagues = data.leagues || [];
+
+    if (!leagues.length) {
+      text += "❌ FT ပွဲ မ ရှိပါ";
+      await sendMessage(chatId, text, env);
+      return;
+    }
+
+    leagues.forEach(function(lg) {
+      text += "🏆 " + lg.name + " — " + lg.round + " (" + lg.count + ")\n";
+      text += "O/U : " + (lg.ou || "-") + "\n";
+      text += "AH  : " + (lg.ah || "-") + "\n";
+      text += "HA  : " + (lg.ha || "-") + "\n\n";
+    });
+
+    const six = data.six || {};
+    text += "═══ 6 League Total ═══\n";
+    text += "O/U : " + (six.ou || "-") + "\n";
+    text += "AH  : " + (six.ah || "-") + "\n";
+    text += "HA  : " + (six.ha || "-") + "\n";
+
+    await sendMessage(chatId, text, env);
+  } catch (e) {
+    await sendMessage(chatId, "⚠️ Round Stats error: " + e.message, env);
+  }
+}
+
+async function sendYResults(chatId, env, dateParam) {
+  try {
+    var url = SHEET_URL + "?action=ylog";
+    if (dateParam) url += "&date=" + encodeURIComponent(dateParam);
+
+    const res = await fetch(url, { redirect: "follow" });
+    const data = JSON.parse(await res.text());
+
+    if (!data || !data.ok) {
+      await sendMessage(chatId, "⚠️ Y_Log မရပါ", env);
+      return;
+    }
+
+    const rows = data.rows || [];
+    if (!rows.length) {
+      await sendMessage(chatId, "❌ Y ပွဲ မ ရှိပါ", env);
+      return;
+    }
+
+    let text = "📊 Y RESULTS";
+    if (dateParam) text += " — " + dateParam;
+    text += "\n\n";
+
+    let pass = 0, fail = 0, pending = 0;
+
+    rows.forEach(function(r) {
+      var ft = "-";
+      if (r.ft_home !== null && r.ft_home !== '' && r.ft_away !== null && r.ft_away !== '') {
+        ft = r.ft_home + "-" + r.ft_away;
+      }
+
+      var res = r.result || "⏳";
+      if (res === "✅") pass++;
+      else if (res === "❌") fail++;
+      else pending++;
+
+      text += res + " " + r.home + " vs " + r.away + " | " + ft + "\n";
+    });
+
+    text += "\n✅ " + pass + " | ❌ " + fail + " | ⏳ " + pending;
+
+    if (text.length > 4000) text = text.slice(0, 4000) + "\n...";
+
+    await sendMessage(chatId, text, env);
+  } catch (e) {
+    await sendMessage(chatId, "⚠️ Y Results error: " + e.message, env);
+  }
+}
